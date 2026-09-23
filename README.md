@@ -26,7 +26,7 @@ The obvious ways to reflash all **write the NVMe too** (Seeed's tool, `l4t_initr
 
 - Turing Pi 2/2.5 with the BMC reachable, and [`tpi`](https://github.com/turing-machines/tpi) on your PC.
 - A **USB-C data cable** from the board's flashing port (**USB_OTG**, a.k.a. the "4xnode USB_DEV" USB-C) to your PC. The board has three USB-C ports; the other two are the BMC's USB serial and UART console. The right one shows `NVIDIA … recovery mode` in `lsusb`.
-- A Linux PC (x86_64) with NVIDIA **Jetson Linux** matching your module's JetPack: the BSP *and* the Sample Root Filesystem, unpacked and `apply_binaries.sh` already run. See [docs/HOST-NOTES.md](docs/HOST-NOTES.md) — recent Ubuntu versions need two small workarounds.
+- A Linux PC (x86_64) with NVIDIA **Jetson Linux** matching your module's JetPack: only the **Driver Package (BSP)**, extracted so you have `Linux_for_Tegra/` (no root filesystem and no `apply_binaries.sh` needed for these scripts). See [docs/HOST-NOTES.md](docs/HOST-NOTES.md) for a few missing packages on recent Ubuntu versions.
 - `sudo` on that PC.
 
 ## The method
