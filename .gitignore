@@ -1,0 +1,6 @@
+*.log
+qspi-backup-*/
+Linux_for_Tegra/
+*.tbz2
+*.img
+*.img.xz
