@@ -61,6 +61,10 @@ export WORKDIR=~/jetson-recovery      # the directory that contains Linux_for_Te
    TARGET=nx16 scripts/qspi.sh flash     # verifies the backup, asks you to type FLASH
    ```
 6. The module reboots by itself. Watch for the green LED and a DHCP lease; log in as you always did.
+7. **Take the node out of flash mode** so it still boots after a restart (see [why](docs/TROUBLESHOOTING.md#a-node-comes-up-in-recovery-mode-after-the-board-restarts)):
+   ```bash
+   scripts/tp-park-usb.sh 4          # park the USB selection on an EMPTY slot (or an RK1/CM4 node)
+   ```
 
 Do one module at a time, and use a different `TARGET` label (`nx16`, `nano8`, …) for each so backups never overwrite each other. Only **one** Jetson may be in recovery mode while the tools run.
 
