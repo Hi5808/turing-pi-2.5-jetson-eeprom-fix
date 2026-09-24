@@ -7,6 +7,7 @@
 #   TARGET=<label> ./qspi.sh prepare   detect the module + build NVIDIA's command file (writes NOTHING)
 #   TARGET=<label> ./qspi.sh dump      READ every QSPI partition into ./qspi-backup-<label>/ (read-only)
 #   TARGET=<label> ./qspi.sh flash     write ONLY the QSPI (needs a verified backup + the EEPROM fix)
+#   TARGET=<label> ./qspi.sh restore   UNDO: put the original boot flash back from the backup (DRY_RUN=1 = read-only)
 #
 # Environment:
 #   TARGET   required. Any label you like (e.g. nx16, nano8). Keeps backups of different modules apart.
@@ -122,5 +123,106 @@ flash)
     cd "$L4T"
     sudo ./flash.sh "$BOARD" internal 2>&1 | tee -a "$LOG"
     ;;
-*) echo "usage: TARGET=<label> $0 prepare|dump|flash"; exit 2 ;;
+restore)
+    # UNDO: put the ORIGINAL boot flash back from a verified backup.
+    # Writes only the partitions that differ from the backup, reads every write back and
+    # compares it, and stops at the first problem. The module is coldbooted at the end.
+    #   DRY_RUN=1  only report which partitions differ; write nothing (read-only)
+    #   NO_REBOOT=1  leave the module in recovery mode when done
+    # Skipped on purpose: BCT (boot-ROM table, unchanged by the fix), the two GPT copies,
+    # and uefi_variables / uefi_ftw (the running firmware rewrites those on every boot).
+    one_in_recovery
+    ( cd "$OUT" && [ "$(ls -1 *.bin | wc -l)" -ge 60 ] && sha256sum -c --quiet SHA256SUMS ) \
+        || { echo "Backup missing or damaged in $OUT."; exit 1; }
+    [ -s "$BL/flashcmd.txt" ] || { echo "Run 'TARGET=$TARGET ./qspi.sh prepare' first, on THIS module."; exit 1; }
+    if [ "${DRY_RUN:-0}" != 1 ]; then
+        echo "This writes the ORIGINAL boot flash (QSPI) back from: $OUT"
+        echo "If that original firmware did not boot on this board, run './qspi.sh flash' afterwards to re-apply the fix."
+        read -r -p "Type RESTORE to continue: " ans
+        [ "$ans" = "RESTORE" ] || { echo "Cancelled."; exit 1; }
+    fi
+    sudo -v
+    DRY_RUN="${DRY_RUN:-0}" NO_REBOOT="${NO_REBOOT:-0}" python3 - "$BL" "$CFG" "$OUT" <<'PY' 2>&1 | tee -a "$LOG"
+import subprocess, sys, os, tempfile, shutil
+import xml.etree.ElementTree as ET
+bl, cfg, out = sys.argv[1:4]
+dry = os.environ.get("DRY_RUN") == "1"
+no_reboot = os.environ.get("NO_REBOOT") == "1"
+base = open(os.path.join(bl, "flashcmd.txt")).read().strip()
+i = base.rfind('--cmd "')
+if i < 0:
+    sys.exit("no --cmd found in flashcmd.txt")
+j = base.find('"', i + 7)
+sizes, inst = {}, "0"
+for d in ET.parse(cfg).getroot().iter("device"):
+    if d.attrib.get("type") == "spi":
+        inst = d.attrib.get("instance", "0")
+        for p in d.iter("partition"):
+            s = (p.find("size").text or "").strip()
+            if s and p.attrib["name"] != "secondary_gpt":
+                sizes[p.attrib["name"]] = int(s, 0)
+SKIP = {"BCT", "secondary_gpt", "secondary_gpt_backup", "uefi_variables", "uefi_ftw"}
+names = [n for n in sizes if n not in SKIP and os.path.exists(os.path.join(out, n + ".bin"))]
+names.sort(key=lambda n: ("BCT" in n, n))          # *_BCT partitions last, like NVIDIA's own flash
+
+def run(cmd):
+    return subprocess.run(["sudo", "bash", "-c", "cd '%s' && %s" % (bl, cmd)],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+tmp = tempfile.mkdtemp(prefix="qspi-restore-")
+def cleanup():
+    subprocess.run(["sudo", "rm", "-rf", tmp])
+def fail(msg, r=None):
+    print("STOPPED: " + msg)
+    if r is not None:
+        print(r.stdout[-1200:])
+    cleanup()
+    sys.exit(1)
+
+print("== starting module session", flush=True)
+sess = os.path.join(tmp, "session.bin")
+r = run(base[:i] + '--cmd "read BCT %s"' % sess + base[j + 1:])
+if not (os.path.exists(sess) and os.path.getsize(sess) == 1048576):
+    fail("could not start a session. Power-cycle the module into recovery (tp-recovery.sh) and try again.", r)
+
+def read_current(name):
+    dst = os.path.join(tmp, name + ".cur")
+    if os.path.exists(dst):
+        subprocess.run(["sudo", "rm", "-f", dst])
+    r = run("./tegradevflash_v2 --read /spi/%s/%s '%s'" % (inst, name, dst))
+    if not os.path.exists(dst) or os.path.getsize(dst) != sizes[name]:
+        fail("could not read current contents of %s" % name, r)
+    return open(dst, "rb").read()
+
+same, todo, restored = [], [], []
+for name in names:
+    want = open(os.path.join(out, name + ".bin"), "rb").read()
+    if len(want) != sizes[name]:
+        fail("backup file for %s has the wrong size" % name)
+    if read_current(name) == want:
+        same.append(name)
+        print("   same     %s" % name, flush=True)
+        continue
+    todo.append(name)
+    if dry:
+        print("   DIFFERS  %s  (would restore)" % name, flush=True)
+        continue
+    # NOR flash must be ERASED before it is written, otherwise old and new bytes are ANDed together.
+    # (NVIDIA's own sparse QSPI update does the same: --erase, then --write.)
+    run("./tegradevflash_v2 --erase /spi/%s/%s" % (inst, name))
+    r = run("./tegradevflash_v2 --write /spi/%s/%s '%s'" % (inst, name, os.path.join(out, name + ".bin")))
+    if read_current(name) != want:
+        fail("%s did not verify after writing. Do NOT reboot; re-run restore." % name, r)
+    restored.append(name)
+    print("   RESTORED %s  (verified by read-back)" % name, flush=True)
+
+print("\nSUMMARY: %d checked, %d already identical, %d %s" % (
+    len(names), len(same), len(todo), "differ (dry run, nothing written)" if dry else "restored and verified"))
+if not dry and not no_reboot:
+    print("== coldbooting the module", flush=True)
+    run("./tegradevflash_v2 --reboot coldboot")
+cleanup()
+PY
+    ;;
+*) echo "usage: TARGET=<label> $0 prepare|dump|flash|restore"; exit 2 ;;
 esac

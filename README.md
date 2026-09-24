@@ -64,9 +64,35 @@ export WORKDIR=~/jetson-recovery      # the directory that contains Linux_for_Te
 
 Do one module at a time, and use a different `TARGET` label (`nx16`, `nano8`, …) for each so backups never overwrite each other. Only **one** Jetson may be in recovery mode while the tools run.
 
-### Restoring
+### Undoing it (restore)
 
-The backup is a raw image of every QSPI partition. To put a partition back, start the module in a fresh recovery session and use NVIDIA's loader directly, e.g. `sudo ./tegradevflash_v2 --write /spi/0/A_mb1 qspi-backup-nx16/A_mb1.bin` (after a `read BCT` session start as `qspi.sh dump` does). Restore is not automated here; if you need it and get stuck, open an issue.
+`qspi.sh restore` puts your original boot flash back from the backup. It reads the module's current contents, **writes only the partitions that differ**, reads every write back to verify it, stops at the first problem, and coldboots the module at the end.
+
+```bash
+scripts/tp-recovery.sh 2                           # fresh recovery session
+TARGET=nx16 DRY_RUN=1 scripts/qspi.sh restore      # read-only: shows what WOULD change
+TARGET=nx16 scripts/qspi.sh restore                # asks you to type RESTORE
+```
+
+Tested round-trip on an Orin Nano: fix applied (boots) → `restore` (10 partitions restored, each verified by read-back) → the original firmware again fails to boot on the Turing Pi and the module drops into USB recovery mode → `flash` again (boots, NVMe data intact). Restoring does **not** make an unbootable module boot on your Turing Pi; it returns the original state. Re-run `flash` to get the fix back.
+
+Not restored on purpose: `BCT` (boot-ROM table, unchanged by the fix), the GPT copies, and `uefi_variables`/`uefi_ftw` (the running firmware rewrites those on every boot).
+
+> **Never write flash without erasing first.** Our first restore attempt wrote a partition without an `--erase`; NOR flash then ANDs old and new bytes together and the read-back check failed. `restore` now erases before writing (as NVIDIA's own sparse QSPI update does). If you script your own writes with `tegradevflash_v2`, do the same and always verify by reading back.
+
+## What the fix actually changes
+
+Comparing an original backup with the module after the fix (`qspi.sh restore` in dry-run mode) shows that **only 10 of 56 partitions differ**: five kinds, each in both boot slots (A and B).
+
+| Partition | What it is |
+|---|---|
+| `mb2` | MB2 bootloader, contains the MB2 BCT, where the carrier-EEPROM read size lives |
+| `MB1_BCT` | early hardware configuration: pin-mux, pad voltages, power |
+| `cpu-bootloader` | UEFI plus its device tree |
+| `dce-fw` | display firmware bundled with a device tree |
+| `VER` | version stamps |
+
+Everything else (MB1, memory config, BPMP, secure OS, USB/PSC/TSEC firmware, …) was already identical. If you are hunting the single setting responsible for the non-boot, it is one of these.
 
 ## Tested on
 
@@ -82,8 +108,8 @@ Not tested: Turing Pi 2 (v2.0 board), other JetPack releases, Orin NX 8GB / Nano
 
 ## What we don't know
 
-- **The exact root cause.** The Seeed tag is visible inside the modules' UEFI variables and the modules boot after the reflash, but we never proved which single setting was stopping the boot. Treat "boot firmware for the wrong carrier + missing carrier EEPROM" as the working explanation, not a finding.
-- Whether the EEPROM change alone would have sufficed. We applied both together.
+- **The exact root cause.** We narrowed it to 10 partitions ([above](#what-the-fix-actually-changes)) but never proved which single setting was stopping the boot. Treat "boot firmware for the wrong carrier + missing carrier EEPROM" as the working explanation, not a finding.
+- Whether the EEPROM change alone would have sufficed. We applied it together with NVIDIA's standard configuration, so the effects are mixed.
 - Whether older JetPack releases (R35/R36) behave the same; board names and paths differ (`ls Linux_for_Tegra/*-qspi.conf`).
 
 ## Safety
